@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Test B, from the host: build the image once, then measure each bridge in its
-# own container so neither can disturb the other's graph.
+# Test B, from the host: build the image once, then run each case in its own
+# container so none can disturb another's graph.
 #
 #   tests/run-container-tests.sh [RUNS]
 set -eu
@@ -27,5 +27,9 @@ echo "=== container 2: pw-ac3-bridge --decode-to ==="
 run pw-ac3-native native "$RUNS"
 
 echo
-echo "=== container 2: rebuild and idle scenarios ==="
+echo "=== container 3: rebuild and idle scenarios ==="
 run pw-ac3-scenarios scenarios
+
+echo
+echo "=== container 4: the real iec958 output path ==="
+run pw-ac3-passthrough passthrough

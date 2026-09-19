@@ -5,6 +5,8 @@
 #                                     athena's ac3-bridge.sh
 #   container-test.sh native [RUNS]   pw-ac3-bridge --decode-to
 #   container-test.sh scenarios       sink vanish and idle teardown (native only)
+#   container-test.sh passthrough     the real iec958 output path, against a
+#                                     stand-in sink that accepts only iec958/AC3
 #
 # Three private null sinks: the probe signal goes into measure_in, the bridge
 # reads its monitor and puts decoded 5.1 into measure_out, and both monitors are
@@ -278,11 +280,92 @@ scenario_idle() {
     return 0
 }
 
+scenario_passthrough() {
+    echo "--- passthrough: the real iec958 output path ---"
+    local sink=/src/tests/iec958-sink
+    local got=$W/received.spdif
+
+    "$sink" iec958_probe "$got" >"$W/iecsink.log" 2>&1 &
+    local sinkpid=$!
+    sleep 2
+
+    # No --decode-to: this is the output half the target host uses, offering
+    # iec958/AC3 and nothing else.
+    "$BIN" --source measure_in --sink iec958_probe --idle 3600 --verbose \
+        >"$W/bridge.log" 2>&1 &
+    echo $! >"$W/bridge.pid"
+
+    start_keepalive
+    sleep 3
+    grep -q "streams up" "$W/bridge.log" \
+        && echo "  bridge came up in passthrough mode" \
+        || { echo "  FAIL: bridge never came up"; kill $sinkpid; return 1; }
+
+    grep -q "negotiated iec958 codec=3 rate=48000" "$W/iecsink.log" \
+        && echo "  sink negotiated iec958 AC3 at 48 kHz" \
+        || { echo "  FAIL: no iec958 format negotiated"; cat "$W/iecsink.log";
+             kill $sinkpid; return 1; }
+    grep -q "linked and streaming" "$W/iecsink.log" \
+        && echo "  session manager linked the encoded-only stream" \
+        || { echo "  FAIL: never linked"; kill $sinkpid; return 1; }
+
+    mpv --no-video --ao=pipewire --audio-device=pipewire/measure_in \
+        --audio-channels=5.1 --msg-level=all=error "$W/probe.wav" \
+        >/dev/null 2>&1
+    sleep 1
+    stop_keepalive
+    stop_native_bridge
+    kill "$sinkpid" 2>/dev/null; wait "$sinkpid" 2>/dev/null
+
+    # What the stand-in sink received must be a real IEC 61937 stream.
+    local desc
+    desc=$(ffprobe -v error -f spdif -i "$got" \
+           -show_entries stream=codec_name,channels,sample_rate \
+           -of "csv=p=0" 2>/dev/null | head -1)
+    [ "$desc" = "ac3,48000,6" ] \
+        && echo "  received bytes demux as $desc" \
+        || { echo "  FAIL: received stream is '$desc', expected ac3,48000,6";
+             return 1; }
+
+    ffmpeg -v error -f spdif -i "$got" -f wav -y "$W/received.wav"
+    local n
+    n=$(ffmpeg -i "$W/received.wav" -af "silencedetect=n=-30dB:d=0.05" \
+        -f null - 2>&1 | grep -c "silence_end")
+    [ "$n" -ge 10 ] \
+        && echo "  $n tone onsets survived the bitstream round trip" \
+        || { echo "  FAIL: only $n tone onsets in the received bitstream";
+             return 1; }
+
+    # The other half of the contract: a bitstream must never end up in a sink
+    # that cannot carry it. Pointed at a raw-only null sink, the stream must
+    # fail to link rather than play noise into it.
+    "$BIN" --source measure_in --sink measure_out --idle 3600 --verbose \
+        >"$W/bridge.log" 2>&1 &
+    echo $! >"$W/bridge.pid"
+    start_keepalive
+    sleep 4
+    stop_keepalive
+    stop_native_bridge
+    if pw-link -l 2>/dev/null | grep -q "pw-ac3-bridge.*measure_out"; then
+        echo "  FAIL: encoded stream was linked to a raw-only sink"
+        return 1
+    fi
+    grep -q "stream lost" "$W/bridge.log" \
+        && echo "  refused to link the bitstream into a raw-only sink" \
+        || { echo "  FAIL: no error against a raw-only sink"; return 1; }
+    return 0
+}
+
 # -------------------------------------------------------------------- main
 
 start_session
 load_sinks
 make_signal
+
+if [ "$MODE" = passthrough ]; then
+    scenario_passthrough && { echo; echo "PASSTHROUGH PASS"; exit 0; }
+    echo; echo "PASSTHROUGH FAIL"; exit 1
+fi
 
 if [ "$MODE" = scenarios ]; then
     rc=0

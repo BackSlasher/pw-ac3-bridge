@@ -1,3 +1,4 @@
 /pw-ac3-bridge
 /tests/core-test
+/tests/iec958-sink
 *.o

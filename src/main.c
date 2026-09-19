@@ -64,6 +64,10 @@
 #define PCM_STRIDE  (CHANNELS * (int)sizeof(float))	/* --decode-to output */
 #define IEC_STRIDE  4					/* 2 ch x S16LE */
 #define MAX_LINKS   256
+/* Both streams share a node.group, which puts the null sink's subgraph and the
+ * real sink's subgraph under one driver. Without it the null sink runs on its
+ * own timer and the ring slips a frame whenever the two clocks drift apart. */
+#define NODE_GROUP  "pw-ac3-bridge"
 /* Eight AC-3 frames, ~256 ms. Only ever holds a fraction of one in steady
  * state; the headroom is there to absorb a scheduling hiccup, not to buffer. */
 #define RING_SIZE   (8 * AC3PACK_BURST_BYTES)
@@ -367,6 +371,7 @@ static int start_streams(struct impl *i)
 		PW_KEY_NODE_DESCRIPTION, "AC-3 bridge capture",
 		PW_KEY_APP_NAME, "pw-ac3-bridge",
 		PW_KEY_STREAM_CAPTURE_SINK, "true",
+		PW_KEY_NODE_GROUP, NODE_GROUP,
 		PW_KEY_NODE_DONT_RECONNECT, "true",
 		PW_KEY_TARGET_OBJECT, i->source_name,
 		NULL);
@@ -412,6 +417,7 @@ static int start_streams(struct impl *i)
 		PW_KEY_NODE_NAME, "pw-ac3-bridge",
 		PW_KEY_NODE_DESCRIPTION, "AC-3 bridge",
 		PW_KEY_APP_NAME, "pw-ac3-bridge",
+		PW_KEY_NODE_GROUP, NODE_GROUP,
 		PW_KEY_NODE_DONT_RECONNECT, "true",
 		PW_KEY_TARGET_OBJECT,
 			i->decode_to ? i->decode_to : i->sink_name,

@@ -18,7 +18,7 @@
  *   rebuilt.
  *
  *   capture -> encode -> ring -> playback.  The two streams are separate graph
- *   nodes with their own clocks, so a ring sits between them. It is a byte ring
+ *   nodes under one driver (see NODE_GROUP), with a ring between them. It is a byte ring
  *   with no prefill: the playback side takes what is there and zero-fills the
  *   rest, which parks the steady-state fill at the phase offset between the two
  *   nodes — the smallest value the graph allows. Both streams ask for

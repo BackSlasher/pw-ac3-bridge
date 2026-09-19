@@ -70,19 +70,22 @@ manager treat the node as encoded-only: it will link it to a sink that advertise
 the same codec and put that sink into passthrough mode, or refuse to link it at
 all.
 
-**The ring.** Capture and playback are two graph nodes with their own clocks, so
-a byte ring sits between them; it is the only buffering in the program. It is not
-prefilled. The playback side takes whatever is there and zero-fills the rest,
-which means the steady-state fill settles at the phase offset between the two
-nodes — the smallest value the graph allows — after a single zero-fill at start-up.
-Zeroes are silence on the decoded path, and on the bitstream path they are the
-null data IEC 61937 already carries between bursts, which a receiver rides out and
-resyncs from on the next preamble. The ring is eight frames deep, as
-headroom against a scheduling hiccup rather than as latency. Two 48 kHz clocks on
-one machine drift by a few ppm, which works out to a dropped or repeated frame on
-the order of once every few minutes of continuous play; at 32 ms per frame that
-is below the threshold of notice, and there is no resampler in the path to hide
-it.
+**The ring.** Capture and playback are two graph nodes, so a byte ring sits
+between them; it is the only buffering in the program. It is not prefilled. The
+playback side takes whatever is there and zero-fills the rest, which means the
+steady-state fill settles at the phase offset between the two nodes — the
+smallest value the graph allows — after a single zero-fill at start-up. Zeroes
+are silence on the decoded path, and on the bitstream path they are the null data
+IEC 61937 already carries between bursts, which a receiver rides out and resyncs
+from on the next preamble. The ring is eight frames deep, as headroom against a
+scheduling hiccup rather than as latency.
+
+**One clock.** A null sink is a driver of its own, on a system timer, and the real
+sink runs on the hardware clock; left alone the two halves of the bridge would
+drift apart and the ring would drop or repeat a frame every few minutes. Both
+streams carry the same `node.group`, which makes PipeWire schedule the null sink's
+subgraph and the real sink's subgraph under one driver — the hardware one — so the
+ring's fill is constant and there is nothing for a resampler to correct.
 
 **Activity.** A client playing into the null sink appears as a link whose input
 node is that sink. The bridge's own capture attaches to the monitor — the output

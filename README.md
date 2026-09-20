@@ -28,6 +28,8 @@ pw-ac3-bridge [options]
                      and play that into NAME instead of bitstreaming
   --idle SECONDS     keep the streams up this long after the last client leaves,
                      so the receiver keeps its lock (default: 1800)
+  --delay MS         hold the audio back by this many milliseconds (default: 0,
+                     maximum 500)
   --bitrate BPS      AC-3 bitrate (default: 640000)
   --verbose          log format negotiation and buffer counters
 ```
@@ -86,6 +88,12 @@ drift apart and the ring would drop or repeat a frame every few minutes. Both
 streams carry the same `node.group`, which makes PipeWire schedule the null sink's
 subgraph and the real sink's subgraph under one driver — the hardware one — so the
 ring's fill is constant and there is nothing for a resampler to correct.
+
+**Delay.** `--delay` holds the audio back, for a display whose picture arrives
+later than the receiver's sound. It is a circular delay line on the PCM in front of
+the encoder rather than extra fill in the ring, so the amount is exact to the
+sample and independent of how the two streams started up. Unlike a player's
+audio offset it applies to everything the session plays.
 
 **Activity.** A client playing into the null sink appears as a link whose input
 node is that sink. The bridge's own capture attaches to the monitor — the output

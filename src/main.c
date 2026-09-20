@@ -90,6 +90,7 @@ struct impl {
 	const char *sink_name;
 	const char *decode_to;
 	int idle_secs;
+	int delay_ms;
 	int64_t bitrate;
 	bool verbose;
 
@@ -112,6 +113,9 @@ struct impl {
 	/* capture-side accumulator: one AC-3 frame of interleaved float */
 	float in_buf[AC3PACK_FRAME_SAMPLES * CHANNELS];
 	uint32_t in_fill;		/* frames */
+	float *delay_line;		/* delay_frames * CHANNELS, circular */
+	uint32_t delay_frames;
+	uint32_t delay_pos;
 	float dec_buf[AC3PACK_FRAME_SAMPLES * CHANNELS];	/* --decode-to */
 	int capture_channels;
 
@@ -169,9 +173,26 @@ static void on_capture_process(void *data)
 		int32_t filled;
 		uint32_t widx;
 
-		memcpy(&i->in_buf[i->in_fill * CHANNELS],
-		       &src[(size_t)off * CHANNELS],
-		       (size_t)take * PCM_STRIDE);
+		if (i->delay_frames == 0) {
+			memcpy(&i->in_buf[i->in_fill * CHANNELS],
+			       &src[(size_t)off * CHANNELS],
+			       (size_t)take * PCM_STRIDE);
+		} else {
+			/* --delay: every sample goes through a circular delay line
+			 * on its way to the encoder. Done on the PCM, not in the
+			 * ring, so the amount is exact to the sample and does not
+			 * depend on how the two streams happened to start up. */
+			float *in = &i->in_buf[i->in_fill * CHANNELS];
+			const float *cur = &src[(size_t)off * CHANNELS];
+			uint32_t k;
+			for (k = 0; k < take; k++) {
+				float *slot = &i->delay_line[(size_t)i->delay_pos * CHANNELS];
+				memcpy(&in[(size_t)k * CHANNELS], slot, PCM_STRIDE);
+				memcpy(slot, &cur[(size_t)k * CHANNELS], PCM_STRIDE);
+				if (++i->delay_pos == i->delay_frames)
+					i->delay_pos = 0;
+			}
+		}
 		i->in_fill += take;
 		off += take;
 		if (i->in_fill < AC3PACK_FRAME_SAMPLES)
@@ -359,6 +380,9 @@ static int start_streams(struct impl *i)
 
 	spa_ringbuffer_init(&i->ring);
 	i->in_fill = 0;
+	i->delay_pos = 0;
+	if (i->delay_frames > 0)
+		memset(i->delay_line, 0, (size_t)i->delay_frames * PCM_STRIDE);
 	i->capture_channels = CHANNELS;
 	i->underruns = i->overruns = i->encoded = 0;
 
@@ -658,6 +682,9 @@ static void usage(const char *argv0)
 "                     PCM and play that into NAME instead of bitstreaming\n"
 "  --idle SECONDS     keep the streams up this long after the last client\n"
 "                     leaves, so the receiver keeps its lock (default: 1800)\n"
+"  --delay MS         hold the audio back by this many milliseconds, for a\n"
+"                     display that is slower than the receiver (default: 0,\n"
+"                     maximum 500)\n"
 "  --bitrate BPS      AC-3 bitrate (default: 640000)\n"
 "  --verbose          log format negotiation and buffer counters\n"
 "  --help\n", argv0);
@@ -679,6 +706,7 @@ int main(int argc, char **argv)
 		{ "sink",      required_argument, NULL, 'k' },
 		{ "decode-to", required_argument, NULL, 'd' },
 		{ "idle",      required_argument, NULL, 'i' },
+		{ "delay",     required_argument, NULL, 'D' },
 		{ "bitrate",   required_argument, NULL, 'b' },
 		{ "verbose",   no_argument,       NULL, 'v' },
 		{ "help",      no_argument,       NULL, 'h' },
@@ -688,12 +716,13 @@ int main(int argc, char **argv)
 	char err[256] = "";
 	int c;
 
-	while ((c = getopt_long(argc, argv, "s:k:d:i:b:vh", opts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "s:k:d:i:D:b:vh", opts, NULL)) != -1) {
 		switch (c) {
 		case 's': i->source_name = optarg; break;
 		case 'k': i->sink_name = optarg; break;
 		case 'd': i->decode_to = optarg; break;
 		case 'i': i->idle_secs = atoi(optarg); break;
+		case 'D': i->delay_ms = atoi(optarg); break;
 		case 'b': i->bitrate = atoll(optarg); break;
 		case 'v': i->verbose = true; break;
 		case 'h': usage(argv[0]); return 0;
@@ -702,6 +731,18 @@ int main(int argc, char **argv)
 	}
 
 	i->out_stride = i->decode_to ? PCM_STRIDE : IEC_STRIDE;
+	if (i->delay_ms < 0 || i->delay_ms > 500) {
+		fprintf(stderr, "--delay must be between 0 and 500 ms\n");
+		return 2;
+	}
+	i->delay_frames = (uint32_t)i->delay_ms * RATE / 1000;
+	if (i->delay_frames > 0) {
+		i->delay_line = calloc(i->delay_frames, PCM_STRIDE);
+		if (i->delay_line == NULL) {
+			fprintf(stderr, "out of memory\n");
+			return 1;
+		}
+	}
 
 	i->enc = ac3pack_new(RATE, CHANNELS, i->bitrate, err, sizeof(err));
 	if (i->enc == NULL) {

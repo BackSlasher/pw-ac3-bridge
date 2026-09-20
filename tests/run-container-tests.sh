@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Test B, from the host: build the image once, then run each case in its own
 # container so none can disturb another's graph.
 #

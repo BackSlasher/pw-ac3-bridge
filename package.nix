@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # callPackage-style derivation for the target NixOS host.
 #
-#   ac3-bridge = pkgs.callPackage ./pw-ac3-bridge/package.nix { };
+#   ac3-bridge = pkgs.callPackage "${inputs.pw-ac3-bridge}/package.nix" { };
 #
 # ffmpeg is a build input for its headers and a runtime input for libavcodec and
 # libavutil; only the AC-3 encoder and decoder are used, so ffmpeg-headless is
@@ -14,7 +15,7 @@
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "pw-ac3-bridge";
-  version = "0.1.0";
+  version = "0.2.0";
 
   # .jj is not in cleanSourceFilter's list, and leaving it in the source would
   # make the store path change on every jj operation.
@@ -50,7 +51,7 @@ stdenv.mkDerivation (finalAttrs: {
       without the bridge losing it or being moved onto a sink that cannot carry
       a bitstream.
     '';
-    # No license is declared in the tree yet; set this when one is.
+    license = lib.licenses.lgpl21Plus;
     mainProgram = "pw-ac3-bridge";
     platforms = lib.platforms.linux;
   };

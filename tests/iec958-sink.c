@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* A sink node that accepts nothing but iec958/AC3, and writes what it receives.
  *
  * There is no sound card in the test container, and a null sink advertises only

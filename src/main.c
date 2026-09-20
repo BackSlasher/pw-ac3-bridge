@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* pw-ac3-bridge: turn a 5.1 PCM sink into an AC-3 bitstream for an HDMI receiver.
  *
  * Everything the session plays lands in a 6-channel null sink. This program

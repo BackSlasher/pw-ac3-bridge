@@ -249,3 +249,7 @@ systemd.user.services.ac3-bridge.serviceConfig.ExecStart =
 `Restart = "always"` stays worth keeping, but it should no longer be doing much:
 a sink that comes and goes is handled inside the process, and the only thing that
 ends it now is PipeWire itself going away.
+
+## License
+
+LGPL-2.1-or-later; see `LICENSE`.

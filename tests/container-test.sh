@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Test B, inside the container: measure one bridge implementation black-box.
 #
 #   container-test.sh shell  [RUNS]   the ffmpeg | mpv chain, flags copied from
-#                                     athena's ac3-bridge.sh
+#                                     the shell bridge this program replaced
 #   container-test.sh native [RUNS]   pw-ac3-bridge --decode-to
 #   container-test.sh scenarios       sink vanish and idle teardown (native only)
 #   container-test.sh passthrough     the real iec958 output path, against a
@@ -102,7 +103,7 @@ stop_keepalive() {
 
 # ----------------------------------------------------------------- bridges
 
-# Flags copied from athena's ac3-bridge.sh, minus --audio-spdif=ac3 (see above)
+# Flags copied from the shell bridge this program replaced, minus --audio-spdif=ac3 (see above)
 # and plus --audio-channels=5.1 so the decode reaches measure_out as 6 channels.
 start_shell_bridge() {
     (

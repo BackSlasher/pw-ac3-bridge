@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Test environment for pw-ac3-bridge: a headless PipeWire graph with no sound card.
 #
 # Both the current shell bridge (ffmpeg | mpv) and the native program are measured

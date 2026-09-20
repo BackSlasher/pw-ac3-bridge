@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* Headless test of the encode+pack path, with no PipeWire involved.
  *
  * "gen" synthesizes the six-tone sequence — one tone per channel in

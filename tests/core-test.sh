@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Test A: the encode+pack path as a pure function, no PipeWire.
 #
 # core-test synthesizes the six-tone sequence and writes the IEC 61937 byte

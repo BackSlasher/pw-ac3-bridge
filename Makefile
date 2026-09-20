@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 PREFIX ?= /usr/local
 CC     ?= cc
 PKG_CONFIG ?= pkg-config

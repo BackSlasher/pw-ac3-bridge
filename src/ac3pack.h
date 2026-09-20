@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* AC-3 encoding and IEC 61937 framing, with no PipeWire in it.
  *
  * The unit of work is one AC-3 syncframe: 1536 samples per channel, which on the

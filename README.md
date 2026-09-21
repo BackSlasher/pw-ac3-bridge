@@ -72,28 +72,36 @@ manager treat the node as encoded-only: it will link it to a sink that advertise
 the same codec and put that sink into passthrough mode, or refuse to link it at
 all.
 
-**The ring.** Capture and playback are two graph nodes, so a byte ring sits
-between them; it is the only buffering in the program. It is not prefilled. The
-playback side takes whatever is there and zero-fills the rest, which means the
-steady-state fill settles at the phase offset between the two nodes — the
-smallest value the graph allows — after a single zero-fill at start-up. Zeroes
-are silence on the decoded path, and on the bitstream path they are the null data
-IEC 61937 already carries between bursts, which a receiver rides out and resyncs
-from on the next preamble. The ring is eight frames deep, as headroom against a
-scheduling hiccup rather than as latency.
-
 **One clock.** A null sink is a driver of its own, on a system timer, and the real
 sink runs on the hardware clock; left alone the two halves of the bridge would
-drift apart and the ring would drop or repeat a frame every few minutes. Both
-streams carry the same `node.group`, which makes PipeWire schedule the null sink's
-subgraph and the real sink's subgraph under one driver — the hardware one — so the
-ring's fill is constant and there is nothing for a resampler to correct.
+drift apart. Both streams carry the same `node.group`, which makes PipeWire
+schedule the null sink's subgraph and the real sink's subgraph under one driver —
+the hardware one — so both callbacks see the same clock position every cycle and
+there is nothing for a resampler to correct.
+
+**A fixed latency.** Capture and playback are two graph nodes with a ring between
+them, but the ring is addressed by position, not by fill. Every captured frame has
+a position on the shared clock; frame *n* of the encoded stream was captured at
+`origin + n`, and the playback callback, asked to fill the cycle at position *Q*,
+emits the frames `Q − latency − origin` onwards. What is not encoded yet comes out
+as zeroes — silence on the decoded path, and on the bitstream path the null data
+IEC 61937 already carries between bursts. The latency is
+
+    one AC-3 frame (1536) + one graph cycle + --delay
+
+frames: a frame is complete one AC-3 frame after its first sample, and the
+playback callback may run before the capture's within a cycle. It is a constant of
+the configuration, the same on every start. A design that plays "whatever the
+ring holds" instead settles at whatever phase the two streams happened to start
+in, which on real hardware varied by tens of milliseconds from start to start.
+Skipped cycles are filled with silence so indices keep meaning positions; a
+change of driver or a jump of more than a second starts a new timeline, and
+nothing from the old one is played again.
 
 **Delay.** `--delay` holds the audio back, for a display whose picture arrives
-later than the receiver's sound. It is a circular delay line on the PCM in front of
-the encoder rather than extra fill in the ring, so the amount is exact to the
-sample and independent of how the two streams started up. Unlike a player's
-audio offset it applies to everything the session plays.
+later than the receiver's sound. It is simply added to the latency above, so it is
+exact to the sample. Unlike a player's audio offset it applies to everything the
+session plays.
 
 **Activity.** A client playing into the null sink appears as a link whose input
 node is that sink. The bridge's own capture attaches to the monitor — the output

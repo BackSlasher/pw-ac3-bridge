@@ -19,11 +19,13 @@
  *   rebuilt.
  *
  *   capture -> encode -> ring -> playback.  The two streams are separate graph
- *   nodes under one driver (see NODE_GROUP), with a ring between them. It is a byte ring
- *   with no prefill: the playback side takes what is there and zero-fills the
- *   rest, which parks the steady-state fill at the phase offset between the two
- *   nodes — the smallest value the graph allows. Both streams ask for
- *   node.latency = 1536/48000, one AC-3 frame per cycle.
+ *   nodes under one driver (see NODE_GROUP), so they see the same clock. Every
+ *   captured frame has a position on that clock, and the playback side emits the
+ *   frame captured exactly `latency` positions ago — never "whatever is in the
+ *   ring". The latency is therefore a constant of the configuration
+ *   (one AC-3 frame + one graph cycle + --delay) and identical on every start,
+ *   instead of depending on the phase the two streams happened to start in.
+ *   Both streams ask for node.latency = 1536/48000.
  *
  *   activity.  A client playing into the null sink shows up as a link whose
  *   input node is that sink. The bridge's own capture attaches to the monitor
@@ -55,7 +57,7 @@
 #include <spa/param/audio/iec958-utils.h>
 #include <spa/param/latency-utils.h>
 #include <spa/pod/builder.h>
-#include <spa/utils/ringbuffer.h>
+#include <spa/node/io.h>
 #include <spa/utils/result.h>
 
 #include <pipewire/pipewire.h>
@@ -69,9 +71,15 @@
  * real sink's subgraph under one driver. Without it the null sink runs on its
  * own timer and the ring slips a frame whenever the two clocks drift apart. */
 #define NODE_GROUP  "pw-ac3-bridge"
-/* Eight AC-3 frames, ~256 ms. Only ever holds a fraction of one in steady
- * state; the headroom is there to absorb a scheduling hiccup, not to buffer. */
-#define RING_SIZE   (8 * AC3PACK_BURST_BYTES)
+/* The ring is addressed by frame index, not by fill: frame n of the encoded
+ * stream lives at slot n % RING_FRAMES. ~683 ms, which has to cover the latency
+ * (at most one AC-3 frame + one cycle + the 500 ms --delay limit) with room for
+ * the writer running a little ahead. A power of two keeps the slot arithmetic
+ * continuous when the 64-bit index wraps. */
+#define RING_FRAMES 32768
+/* A capture position this far from the expected one is a new timeline (the
+ * driver changed, or the graph stalled), not a gap to be filled with silence. */
+#define MAX_GAP     RATE
 
 struct link_ref {
 	uint32_t id;
@@ -114,18 +122,31 @@ struct impl {
 	/* capture-side accumulator: one AC-3 frame of interleaved float */
 	float in_buf[AC3PACK_FRAME_SAMPLES * CHANNELS];
 	uint32_t in_fill;		/* frames */
-	float *delay_line;		/* delay_frames * CHANNELS, circular */
-	uint32_t delay_frames;
-	uint32_t delay_pos;
+	uint32_t delay_frames;		/* --delay */
 	float dec_buf[AC3PACK_FRAME_SAMPLES * CHANNELS];	/* --decode-to */
 	int capture_channels;
 
-	struct spa_ringbuffer ring;
-	uint8_t ring_data[RING_SIZE];
+	/* The driver's clock, as each stream sees it. Both are set from the data
+	 * thread (io_changed) and only read there. */
+	struct spa_io_position *capture_pos;
+	struct spa_io_position *playback_pos;
+
+	/* The encoded stream, addressed by frame index. `origin` is the clock
+	 * position of frame 0, so frame n was captured at origin + n and is
+	 * played at origin + n + latency. All of it belongs to the data thread. */
+	uint8_t ring_data[RING_FRAMES * PCM_STRIDE];
+	uint64_t written;		/* frames encoded into the ring so far */
+	uint64_t valid_from;		/* frames before this belong to an older timeline */
+	uint64_t origin;
+	uint64_t next_pos;		/* clock position expected for the next captured frame */
+	uint32_t clock_id;		/* driver the timeline belongs to */
+	bool have_origin;
+	bool started;			/* playback has reached real data */
+	uint32_t max_quantum;		/* largest playback cycle seen, frames */
 
 	/* counters, written from the data thread, read from the timer */
 	uint32_t underruns;
-	uint32_t overruns;
+	uint32_t resyncs;
 	uint32_t encoded;
 
 	time_t idle_since;		/* 0 while a client is linked */
@@ -146,13 +167,110 @@ static void logmsg(struct impl *i, const char *fmt, ...)
 
 /* ---------------------------------------------------------------- streams */
 
+/* The driver clock's position in frames at RATE, from a stream's io area. */
+static bool clock_frames(const struct spa_io_position *pos, uint64_t *frames,
+			 uint32_t *clock_id)
+{
+	const struct spa_io_clock *c;
+
+	if (pos == NULL)
+		return false;
+	c = &pos->clock;
+	if (c->rate.num == 0 || c->rate.denom == 0)
+		return false;
+	*frames = c->position * c->rate.num * RATE / c->rate.denom;
+	*clock_id = c->id;
+	return true;
+}
+
+/* Copy `frames` encoded frames into the ring at frame index `index`. */
+static void ring_write(struct impl *i, uint64_t index, const uint8_t *src,
+		       uint32_t frames)
+{
+	const size_t stride = (size_t)i->out_stride;
+
+	while (frames > 0) {
+		uint32_t slot = (uint32_t)(index % RING_FRAMES);
+		uint32_t run = SPA_MIN(frames, RING_FRAMES - slot);
+
+		if (src != NULL) {
+			memcpy(&i->ring_data[slot * stride], src, run * stride);
+			src += run * stride;
+		} else {
+			memset(&i->ring_data[slot * stride], 0, run * stride);
+		}
+		index += run;
+		frames -= run;
+	}
+}
+
+static void ring_read(struct impl *i, uint64_t index, uint8_t *dst,
+		      uint32_t frames)
+{
+	const size_t stride = (size_t)i->out_stride;
+
+	while (frames > 0) {
+		uint32_t slot = (uint32_t)(index % RING_FRAMES);
+		uint32_t run = SPA_MIN(frames, RING_FRAMES - slot);
+
+		memcpy(dst, &i->ring_data[slot * stride], run * stride);
+		dst += run * stride;
+		index += run;
+		frames -= run;
+	}
+}
+
+/* Feed captured frames (src == NULL: silence) to the encoder. Every completed
+ * AC-3 frame adds exactly AC3PACK_FRAME_SAMPLES frames to the ring, encoded or
+ * not, so a frame's index never stops meaning "this long after the origin". */
+static void feed(struct impl *i, const float *src, uint32_t n_frames)
+{
+	uint32_t off = 0;
+
+	while (off < n_frames) {
+		uint32_t want = AC3PACK_FRAME_SAMPLES - i->in_fill;
+		uint32_t take = SPA_MIN(want, n_frames - off);
+		uint8_t burst[AC3PACK_BURST_BYTES];
+		const uint8_t *out = NULL;
+
+		if (src != NULL)
+			memcpy(&i->in_buf[i->in_fill * CHANNELS],
+			       &src[(size_t)off * CHANNELS],
+			       (size_t)take * PCM_STRIDE);
+		else
+			memset(&i->in_buf[i->in_fill * CHANNELS], 0,
+			       (size_t)take * PCM_STRIDE);
+		i->in_fill += take;
+		off += take;
+		if (i->in_fill < AC3PACK_FRAME_SAMPLES)
+			break;
+		i->in_fill = 0;
+
+		if (ac3pack_encode(i->enc, i->in_buf, burst) >= 0) {
+			i->encoded++;
+			out = burst;
+			if (i->dec != NULL) {
+				/* --decode-to: unpack and decode the burst back to
+				 * PCM, so the path can end in a sink that takes raw
+				 * audio. */
+				int n = ac3unpack_decode(i->dec, burst, i->dec_buf);
+				out = n == AC3PACK_FRAME_SAMPLES ?
+					(const uint8_t *)i->dec_buf : NULL;
+			}
+		}
+		ring_write(i, i->written, out, AC3PACK_FRAME_SAMPLES);
+		i->written += AC3PACK_FRAME_SAMPLES;
+	}
+}
+
 static void on_capture_process(void *data)
 {
 	struct impl *i = data;
 	struct pw_buffer *b;
 	struct spa_data *d;
 	const float *src;
-	uint32_t n_frames, off = 0;
+	uint32_t n_frames, clock_id = 0;
+	uint64_t pos = 0;
 
 	b = pw_stream_dequeue_buffer(i->capture);
 	if (b == NULL)
@@ -165,67 +283,37 @@ static void on_capture_process(void *data)
 	src = SPA_PTROFF(d->data, d->chunk->offset, float);
 	n_frames = d->chunk->size / (uint32_t)(sizeof(float) * CHANNELS);
 
-	while (off < n_frames) {
-		uint32_t want = AC3PACK_FRAME_SAMPLES - i->in_fill;
-		uint32_t take = SPA_MIN(want, n_frames - off);
-		uint8_t burst[AC3PACK_BURST_BYTES];
-		const uint8_t *out_bytes;
-		uint32_t out_len;
-		int32_t filled;
-		uint32_t widx;
+	if (!clock_frames(i->capture_pos, &pos, &clock_id))
+		goto done;
 
-		if (i->delay_frames == 0) {
-			memcpy(&i->in_buf[i->in_fill * CHANNELS],
-			       &src[(size_t)off * CHANNELS],
-			       (size_t)take * PCM_STRIDE);
-		} else {
-			/* --delay: every sample goes through a circular delay line
-			 * on its way to the encoder. Done on the PCM, not in the
-			 * ring, so the amount is exact to the sample and does not
-			 * depend on how the two streams happened to start up. */
-			float *in = &i->in_buf[i->in_fill * CHANNELS];
-			const float *cur = &src[(size_t)off * CHANNELS];
-			uint32_t k;
-			for (k = 0; k < take; k++) {
-				float *slot = &i->delay_line[(size_t)i->delay_pos * CHANNELS];
-				memcpy(&in[(size_t)k * CHANNELS], slot, PCM_STRIDE);
-				memcpy(slot, &cur[(size_t)k * CHANNELS], PCM_STRIDE);
-				if (++i->delay_pos == i->delay_frames)
-					i->delay_pos = 0;
-			}
-		}
-		i->in_fill += take;
-		off += take;
-		if (i->in_fill < AC3PACK_FRAME_SAMPLES)
-			break;
-		i->in_fill = 0;
+	if (i->have_origin && clock_id == i->clock_id &&
+	    pos > i->next_pos && pos - i->next_pos <= MAX_GAP) {
+		/* Cycles were skipped: keep the timeline, fill the hole. */
+		feed(i, NULL, (uint32_t)(pos - i->next_pos));
+	} else if (i->have_origin && clock_id == i->clock_id &&
+		   pos < i->next_pos && i->next_pos - pos < n_frames) {
+		/* Overlap with what was already captured: drop the repeat. */
+		uint32_t skip = (uint32_t)(i->next_pos - pos);
+		src += (size_t)skip * CHANNELS;
+		n_frames -= skip;
+		pos += skip;
+	} else if (!i->have_origin || clock_id != i->clock_id ||
+		   pos != i->next_pos) {
+		/* First buffer, another driver, or a jump too large to bridge:
+		 * the next frame to be written is pinned to this position, and
+		 * nothing encoded on the old timeline is played again. */
+		uint64_t next_index = i->written + i->in_fill;
 
-		if (ac3pack_encode(i->enc, i->in_buf, burst) < 0)
-			continue;
-		i->encoded++;
-
-		if (i->dec != NULL) {
-			/* --decode-to: unpack and decode the burst back to PCM,
-			 * so the path can end in a sink that takes raw audio. */
-			int n = ac3unpack_decode(i->dec, burst, i->dec_buf);
-			if (n <= 0)
-				continue;
-			out_bytes = (const uint8_t *)i->dec_buf;
-			out_len = (uint32_t)n * PCM_STRIDE;
-		} else {
-			out_bytes = burst;
-			out_len = AC3PACK_BURST_BYTES;
-		}
-
-		filled = spa_ringbuffer_get_write_index(&i->ring, &widx);
-		if (filled < 0 || (uint32_t)filled + out_len > RING_SIZE) {
-			i->overruns++;
-			continue;
-		}
-		spa_ringbuffer_write_data(&i->ring, i->ring_data, RING_SIZE,
-					  widx % RING_SIZE, out_bytes, out_len);
-		spa_ringbuffer_write_update(&i->ring, widx + out_len);
+		if (i->have_origin)
+			i->resyncs++;
+		i->origin = pos - next_index;
+		i->valid_from = next_index;
+		i->clock_id = clock_id;
+		i->have_origin = true;
 	}
+
+	feed(i, src, n_frames);
+	i->next_pos = pos + n_frames;
 
 done:
 	pw_stream_queue_buffer(i->capture, b);
@@ -236,8 +324,8 @@ static void on_playback_process(void *data)
 	struct impl *i = data;
 	struct pw_buffer *b;
 	struct spa_data *d;
-	uint32_t want, avail, ridx;
-	int32_t readable;
+	uint32_t want, n_frames, clock_id = 0;
+	uint64_t pos = 0;
 	uint8_t *dst;
 
 	b = pw_stream_dequeue_buffer(i->playback);
@@ -258,34 +346,77 @@ static void on_playback_process(void *data)
 		/* No quantum hint: one AC-3 frame's worth, not a whole buffer. */
 		want = SPA_MIN(want, (uint32_t)AC3PACK_FRAME_SAMPLES * i->out_stride);
 	want -= want % i->out_stride;
+	n_frames = want / (uint32_t)i->out_stride;
 
-	readable = spa_ringbuffer_get_read_index(&i->ring, &ridx);
-	avail = readable > 0 ? (uint32_t)readable : 0;
-	avail -= avail % i->out_stride;
-	if (avail > want)
-		avail = want;
+	/* Zeroes are silence on the PCM path, and on the bitstream path they are
+	 * the null data IEC 61937 already carries between bursts, which a receiver
+	 * resyncs from at the next preamble. */
+	memset(dst, 0, want);
 
-	if (avail > 0) {
-		spa_ringbuffer_read_data(&i->ring, i->ring_data, RING_SIZE,
-					 ridx % RING_SIZE, dst, avail);
-		spa_ringbuffer_read_update(&i->ring, ridx + avail);
-	}
-	if (avail < want) {
-		/* Nothing queued yet. Zeroes are silence on the PCM path, and
-		 * on the bitstream path they are the null data IEC 61937 already
-		 * carries between bursts, which a receiver resyncs from at the
-		 * next preamble. The ring gains a frame doing this, which is how
-		 * the fill settles at the two nodes' phase offset. */
-		memset(dst + avail, 0, want - avail);
-		i->underruns++;
+	if (n_frames > i->max_quantum)
+		i->max_quantum = n_frames;
+
+	if (i->have_origin && clock_frames(i->playback_pos, &pos, &clock_id) &&
+	    clock_id == i->clock_id) {
+		/* A frame is complete one AC-3 frame after its first sample was
+		 * captured, and this callback may run before the capture's in the
+		 * same cycle: one frame plus one cycle is the smallest latency
+		 * that never asks for data that cannot exist yet. */
+		const uint64_t latency = (uint64_t)AC3PACK_FRAME_SAMPLES +
+					 i->max_quantum + i->delay_frames;
+		const uint64_t first_at = i->origin + latency; /* frame 0 plays here */
+		uint64_t from, to, oldest;
+
+		if (pos + n_frames > first_at) {
+			from = pos > first_at ? pos - first_at : 0;
+			to = pos + n_frames - first_at;
+			oldest = i->written > RING_FRAMES ?
+				 i->written - RING_FRAMES : 0;
+
+			if (to > i->written) {
+				/* wanted frames that are not encoded yet */
+				if (i->started)
+					i->underruns++;
+				to = i->written;
+			}
+			if (from < i->valid_from)
+				from = i->valid_from;
+			if (from < oldest)
+				from = oldest;
+			if (from < to) {
+				uint64_t skip = first_at + from - pos;
+
+				ring_read(i, from, dst + skip * (size_t)i->out_stride,
+					  (uint32_t)(to - from));
+				i->started = true;
+			}
+		}
 	}
 
 	d->chunk->offset = 0;
 	d->chunk->size = want;
 	d->chunk->stride = i->out_stride;
-	b->size = want / (uint64_t)i->out_stride;
+	b->size = n_frames;
 
 	pw_stream_queue_buffer(i->playback, b);
+}
+
+static void on_capture_io_changed(void *data, uint32_t id, void *area,
+				  uint32_t size)
+{
+	struct impl *i = data;
+
+	if (id == SPA_IO_Position)
+		i->capture_pos = area;
+}
+
+static void on_playback_io_changed(void *data, uint32_t id, void *area,
+				   uint32_t size)
+{
+	struct impl *i = data;
+
+	if (id == SPA_IO_Position)
+		i->playback_pos = area;
 }
 
 static void on_capture_param_changed(void *data, uint32_t id,
@@ -337,12 +468,14 @@ static const struct pw_stream_events capture_events = {
 	PW_VERSION_STREAM_EVENTS,
 	.state_changed = on_stream_state_changed,
 	.param_changed = on_capture_param_changed,
+	.io_changed = on_capture_io_changed,
 	.process = on_capture_process,
 };
 
 static const struct pw_stream_events playback_events = {
 	PW_VERSION_STREAM_EVENTS,
 	.state_changed = on_stream_state_changed,
+	.io_changed = on_playback_io_changed,
 	.process = on_playback_process,
 };
 
@@ -363,9 +496,12 @@ static void stop_streams(struct impl *i)
 		pw_stream_destroy(i->playback);
 		i->playback = NULL;
 	}
+	/* the io areas belonged to the streams */
+	i->capture_pos = i->playback_pos = NULL;
 	if (was_up)
 		logmsg(i, "streams down (%u frames encoded, %u underruns, "
-		       "%u overruns)", i->encoded, i->underruns, i->overruns);
+		       "%u resyncs, cycle %u frames)", i->encoded, i->underruns,
+		       i->resyncs, i->max_quantum);
 }
 
 static int start_streams(struct impl *i)
@@ -379,13 +515,13 @@ static int start_streams(struct impl *i)
 	if (i->streams_up)
 		return 0;
 
-	spa_ringbuffer_init(&i->ring);
 	i->in_fill = 0;
-	i->delay_pos = 0;
-	if (i->delay_frames > 0)
-		memset(i->delay_line, 0, (size_t)i->delay_frames * PCM_STRIDE);
+	i->written = i->valid_from = i->origin = i->next_pos = 0;
+	i->have_origin = i->started = false;
+	i->max_quantum = 0;
+	i->capture_pos = i->playback_pos = NULL;
 	i->capture_channels = CHANNELS;
-	i->underruns = i->overruns = i->encoded = 0;
+	i->underruns = i->resyncs = i->encoded = 0;
 
 	/* Capture: the null sink's monitor, one AC-3 frame per cycle. */
 	props = pw_properties_new(
@@ -652,14 +788,19 @@ static const struct pw_core_events core_events = {
 static void on_timer(void *data, uint64_t expirations)
 {
 	struct impl *i = data;
-	static uint32_t last_under, last_over;
+	static uint32_t last_under, last_resync, last_quantum;
 
 	if (i->verbose && i->streams_up &&
-	    (i->underruns != last_under || i->overruns != last_over)) {
-		vlog(i, "encoded %u frames, underruns %u, overruns %u",
-		     i->encoded, i->underruns, i->overruns);
+	    (i->underruns != last_under || i->resyncs != last_resync ||
+	     i->max_quantum != last_quantum)) {
+		vlog(i, "encoded %u frames, underruns %u, resyncs %u, latency %u "
+		     "frames (AC-3 frame %d + cycle %u + delay %u)",
+		     i->encoded, i->underruns, i->resyncs,
+		     AC3PACK_FRAME_SAMPLES + i->max_quantum + i->delay_frames,
+		     AC3PACK_FRAME_SAMPLES, i->max_quantum, i->delay_frames);
 		last_under = i->underruns;
-		last_over = i->overruns;
+		last_resync = i->resyncs;
+		last_quantum = i->max_quantum;
 	}
 	update_state(i);
 }
@@ -737,13 +878,6 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	i->delay_frames = (uint32_t)i->delay_ms * RATE / 1000;
-	if (i->delay_frames > 0) {
-		i->delay_line = calloc(i->delay_frames, PCM_STRIDE);
-		if (i->delay_line == NULL) {
-			fprintf(stderr, "out of memory\n");
-			return 1;
-		}
-	}
 
 	i->enc = ac3pack_new(RATE, CHANNELS, i->bitrate, err, sizeof(err));
 	if (i->enc == NULL) {
@@ -759,7 +893,6 @@ int main(int argc, char **argv)
 	}
 
 	pw_init(&argc, &argv);
-	spa_ringbuffer_init(&i->ring);
 
 	i->loop = pw_main_loop_new(NULL);
 	if (i->loop == NULL) {

@@ -15,7 +15,7 @@
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "pw-ac3-bridge";
-  version = "0.2.0";
+  version = "0.3.0";
 
   # .jj is not in cleanSourceFilter's list, and leaving it in the source would
   # make the store path change on every jj operation.
